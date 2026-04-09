@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from storage import Storage
 from commands import StatCog
 from personality import MILESTONES, milestone_message, streak_milestone_message
-from spam import SpamDetector, SpamAdminCog, apply_penalty
+from spam import SpamDetector, SpamAdminCog, TopGGCog, PenaltyManager
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -49,6 +49,8 @@ TOKEN         = os.getenv("DISCORD_TOKEN")
 JSONBIN_KEY   = os.getenv("JSONBIN_API_KEY")
 JSONBIN_BIN   = os.getenv("JSONBIN_BIN_ID") or None
 BOT_PREFIX    = os.getenv("BOT_PREFIX", "!")
+TOPGG_TOKEN   = os.getenv("TOPGG_TOKEN") or None       # optional — enables vote pardons
+TOPGG_ANNOUNCE_CHANNEL = os.getenv("TOPGG_ANNOUNCE_CHANNEL_ID") or None  # optional channel ID
 
 if not TOKEN:
     sys.exit("❌  DISCORD_TOKEN is not set. Check your .env file.")
@@ -66,9 +68,10 @@ intents.reactions        = True
 intents.voice_states     = True
 intents.guilds           = True
 
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
-db           = Storage(api_key=JSONBIN_KEY, bin_id=JSONBIN_BIN)
-spam_detector = SpamDetector()
+bot            = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
+db             = Storage(api_key=JSONBIN_KEY, bin_id=JSONBIN_BIN)
+spam_detector  = SpamDetector()
+penalty_manager = PenaltyManager(db)
 
 # Track previous message counts per user for milestone detection
 _prev_counts: dict[str, int] = {}
@@ -87,7 +90,20 @@ async def on_ready():
         _prev_counts[u["user_id"]] = u["total_messages"]
 
     await bot.add_cog(StatCog(bot, db))
-    await bot.add_cog(SpamAdminCog(bot, db, spam_detector))
+    await bot.add_cog(SpamAdminCog(bot, db, spam_detector, penalty_manager))
+
+    # top.gg vote pardon integration (optional — requires TOPGG_TOKEN in .env)
+    if TOPGG_TOKEN:
+        topgg_cog = TopGGCog(bot, penalty_manager, TOPGG_TOKEN)
+        if TOPGG_ANNOUNCE_CHANNEL:
+            channel = bot.get_channel(int(TOPGG_ANNOUNCE_CHANNEL))
+            if channel:
+                topgg_cog.set_announce_channel(channel)
+        await bot.add_cog(topgg_cog)
+        logger.info("top.gg vote polling enabled.")
+    else:
+        logger.info("TOPGG_TOKEN not set — vote pardons available via !votepardon only.")
+
     periodic_flush.start()
     logger.info("StatSnitch is online and judging everyone. 👀")
     print(f"\n✅  StatSnitch online as {bot.user}\n")
@@ -130,12 +146,7 @@ async def on_message(message: discord.Message):
         has_attachment=bool(message.attachments),
     )
     if spam_result.is_spam:
-        await apply_penalty(
-            message=message,
-            reason=spam_result.reason,
-            delete_msg=spam_result.delete_message,
-            storage=db,
-        )
+        await penalty_manager.enqueue(spam_result, message)
         # Don't count this message toward stats; don't process as command
         return
 
