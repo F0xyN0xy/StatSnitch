@@ -25,6 +25,7 @@ from dotenv import load_dotenv
 from storage import Storage
 from commands import StatCog
 from personality import MILESTONES, milestone_message, streak_milestone_message
+from spam import SpamDetector, SpamAdminCog, apply_penalty
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -66,7 +67,8 @@ intents.voice_states     = True
 intents.guilds           = True
 
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
-db  = Storage(api_key=JSONBIN_KEY, bin_id=JSONBIN_BIN)
+db           = Storage(api_key=JSONBIN_KEY, bin_id=JSONBIN_BIN)
+spam_detector = SpamDetector()
 
 # Track previous message counts per user for milestone detection
 _prev_counts: dict[str, int] = {}
@@ -85,6 +87,7 @@ async def on_ready():
         _prev_counts[u["user_id"]] = u["total_messages"]
 
     await bot.add_cog(StatCog(bot, db))
+    await bot.add_cog(SpamAdminCog(bot, db, spam_detector))
     periodic_flush.start()
     logger.info("StatSnitch is online and judging everyone. 👀")
     print(f"\n✅  StatSnitch online as {bot.user}\n")
@@ -116,13 +119,36 @@ async def on_message(message: discord.Message):
     uname = message.author.display_name
     ts    = message.created_at.replace(tzinfo=timezone.utc)
 
-    # Track the message
+    # ------------------------------------------------------------------
+    # Spam detection — runs BEFORE stat tracking
+    # ------------------------------------------------------------------
+    mention_count = len([m for m in message.mentions if not m.bot])
+    spam_result = spam_detector.check(
+        uid=uid,
+        content=message.content,
+        mention_count=mention_count,
+        has_attachment=bool(message.attachments),
+    )
+    if spam_result.is_spam:
+        await apply_penalty(
+            message=message,
+            reason=spam_result.reason,
+            delete_msg=spam_result.delete_message,
+            storage=db,
+        )
+        # Don't count this message toward stats; don't process as command
+        return
+
+    # ------------------------------------------------------------------
+    # Normal stat tracking
+    # ------------------------------------------------------------------
     db.track_message(
         user_id=uid,
         username=uname,
         content=message.content,
         has_attachment=bool(message.attachments),
         timestamp=ts,
+        bot_prefix=BOT_PREFIX,
     )
 
     # Track mentions received
