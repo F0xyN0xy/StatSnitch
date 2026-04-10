@@ -49,8 +49,10 @@ TOKEN         = os.getenv("DISCORD_TOKEN")
 JSONBIN_KEY   = os.getenv("JSONBIN_API_KEY")
 JSONBIN_BIN   = os.getenv("JSONBIN_BIN_ID") or None
 BOT_PREFIX    = os.getenv("BOT_PREFIX", "!")
-TOPGG_TOKEN   = os.getenv("TOPGG_TOKEN") or None       # optional — enables vote pardons
-TOPGG_ANNOUNCE_CHANNEL = os.getenv("TOPGG_ANNOUNCE_CHANNEL_ID") or None  # optional channel ID
+TOPGG_TOKEN              = os.getenv("TOPGG_TOKEN") or None
+TOPGG_ANNOUNCE_CHANNEL   = os.getenv("TOPGG_ANNOUNCE_CHANNEL_ID") or None
+TOPGG_WEBHOOK_PORT       = int(os.getenv("TOPGG_WEBHOOK_PORT", "0")) or None
+TOPGG_WEBHOOK_AUTH       = os.getenv("TOPGG_WEBHOOK_AUTH") or None
 
 if not TOKEN:
     sys.exit("❌  DISCORD_TOKEN is not set. Check your .env file.")
@@ -89,20 +91,33 @@ async def on_ready():
     for u in db.all_users():
         _prev_counts[u["user_id"]] = u["total_messages"]
 
+    # Store bot ID on storage so penalty announcements can build the vote URL
+    db._bot_id = bot.user.id
+
     await bot.add_cog(StatCog(bot, db))
     await bot.add_cog(SpamAdminCog(bot, db, spam_detector, penalty_manager))
 
-    # top.gg vote pardon integration (optional — requires TOPGG_TOKEN in .env)
-    if TOPGG_TOKEN:
-        topgg_cog = TopGGCog(bot, penalty_manager, TOPGG_TOKEN)
+    # top.gg vote pardon integration
+    if TOPGG_TOKEN or TOPGG_WEBHOOK_PORT:
+        topgg_cog = TopGGCog(
+            bot=bot,
+            penalty_manager=penalty_manager,
+            topgg_token=TOPGG_TOKEN,
+            webhook_port=TOPGG_WEBHOOK_PORT,
+            webhook_auth=TOPGG_WEBHOOK_AUTH,
+        )
         if TOPGG_ANNOUNCE_CHANNEL:
             channel = bot.get_channel(int(TOPGG_ANNOUNCE_CHANNEL))
-            if channel:
+            if isinstance(channel, discord.TextChannel):
                 topgg_cog.set_announce_channel(channel)
         await bot.add_cog(topgg_cog)
-        logger.info("top.gg vote polling enabled.")
+        if TOPGG_WEBHOOK_PORT:
+            await topgg_cog.start_webhook_server()
+            logger.info("top.gg webhook server started on port %s", TOPGG_WEBHOOK_PORT)
+        if TOPGG_TOKEN:
+            logger.info("top.gg vote polling enabled (every %d min)", 5)
     else:
-        logger.info("TOPGG_TOKEN not set — vote pardons available via !votepardon only.")
+        logger.info("No TOPGG_TOKEN or TOPGG_WEBHOOK_PORT — !votepardon manual mode only.")
 
     periodic_flush.start()
     logger.info("StatSnitch is online and judging everyone. 👀")

@@ -42,6 +42,7 @@ from difflib import SequenceMatcher
 from typing import Optional
 
 import aiohttp
+import aiohttp.web
 import discord
 from discord.ext import commands, tasks
 
@@ -373,8 +374,9 @@ class PenaltyManager:
 
         # Announce in channel
         timeout_delta = _timeout_delta(strikes)
+        bot_id = self._storage._bot_id if hasattr(self._storage, '_bot_id') else 0
         announcement  = _build_announcement(uname, strikes, pending.reason,
-                                             freeze_s, timeout_delta)
+                                             freeze_s, timeout_delta, bot_id=bot_id)
         try:
             await pending.message.channel.send(announcement)
         except discord.Forbidden:
@@ -423,17 +425,20 @@ class PenaltyManager:
     # ------------------------------------------------------------------
 
     async def record_vote(self, user_id: str,
-                          channel: Optional[discord.TextChannel] = None) -> None:
+                          channel: Optional[discord.TextChannel] = None,
+                          is_test: bool = False) -> None:
         """
-        Called when a top.gg vote is received.
+        Called when a top.gg vote is received (webhook or poll).
         Halves the user's remaining freeze (min VOTE_MIN_FREEZE_MINS).
+        is_test=True skips the cooldown check so you can test without waiting 12h.
         """
         uid = str(user_id)
 
-        # In-memory cooldown
-        if time.monotonic() - self._last_vote_pardon.get(uid, 0) < VOTE_COOLDOWN_HRS * 3600:
-            logger.debug("Vote pardon cooldown active for %s", uid)
-            return
+        # In-memory cooldown (skip for test votes)
+        if not is_test:
+            if time.monotonic() - self._last_vote_pardon.get(uid, 0) < VOTE_COOLDOWN_HRS * 3600:
+                logger.debug("Vote pardon cooldown active for %s", uid)
+                return
 
         u = self._storage._data.get(uid)
         if not u:
@@ -458,12 +463,13 @@ class PenaltyManager:
             await self._storage.save()
 
             uname = u.get("username", f"<@{uid}>")
-            logger.info("Vote pardon: %s freeze cut to %s",
-                        uname, _fmt_duration(new_remaining))
+            test_label = " *(test vote)*" if is_test else ""
+            logger.info("Vote pardon: %s freeze cut to %s%s",
+                        uname, _fmt_duration(new_remaining), test_label)
 
             if channel:
                 await channel.send(
-                    f"🗳️ **{uname}** voted for StatSnitch on top.gg!\n"
+                    f"🗳️ **{uname}** voted for StatSnitch on top.gg!{test_label}\n"
                     f"Freeze time cut in half → **{_fmt_duration(new_remaining)} remaining**.\n"
                     f"Bribery acknowledged. We respect the hustle. 🎉"
                 )
@@ -476,7 +482,8 @@ class PenaltyManager:
 # ============================================================================
 
 def _build_announcement(name: str, strikes: int, reason: str,
-                         freeze_s: int, timeout_delta: Optional[timedelta]) -> str:
+                         freeze_s: int, timeout_delta: Optional[timedelta],
+                         bot_id: int = 0) -> str:
     freeze_str  = _fmt_duration(freeze_s)
     timeout_str = _fmt_duration(timeout_delta.total_seconds()) if timeout_delta else None
 
@@ -496,8 +503,8 @@ def _build_announcement(name: str, strikes: int, reason: str,
         extra += f" Discord timeout: **{timeout_str}**."
 
     vote_hint = (
-        "\n💡 Vote for StatSnitch on **top.gg** (`!votepardon` after voting) "
-        "to cut your freeze time in half!"
+        f"\n💡 **Second chance:** Vote for the bot at <https://top.gg/bot/{bot_id}/vote> "
+        f"then use `!votepardon` to cut your freeze time in half!"
         if strikes >= 2 else ""
     )
 
@@ -513,31 +520,112 @@ def _build_announcement(name: str, strikes: int, reason: str,
 # ██  TOP.GG POLL COG
 # ============================================================================
 
+# ============================================================================
+# ██  TOP.GG INTEGRATION COG  (poll + optional webhook server)
+# ============================================================================
+
 class TopGGCog(commands.Cog, name="TopGG"):
     """
-    Polls top.gg every TOPGG_POLL_INTERVAL_MINS minutes for new votes
-    and applies pardons automatically.
-    Requires TOPGG_TOKEN set in .env.
+    Handles top.gg vote detection via two complementary methods:
+
+    METHOD 1 — POLLING (always enabled when TOPGG_TOKEN is set)
+      Polls the /votes endpoint every TOPGG_POLL_INTERVAL_MINS minutes.
+      Simple, requires no open port. Slight delay (up to 5 min).
+      NOTE: The /votes endpoint only returns the last 1000 votes total —
+      this is fine for most bots but if you get >1000 votes, use webhooks.
+
+    METHOD 2 — WEBHOOK (enabled when TOPGG_WEBHOOK_PORT is set)
+      top.gg POSTs to your server instantly on every vote.
+      Zero delay, works for any vote volume.
+      Requires a public URL/port (or a reverse proxy like nginx/Caddy).
+      Set TOPGG_WEBHOOK_PORT and TOPGG_WEBHOOK_AUTH in .env.
+      Then point top.gg to: http://your-server-ip:PORT/topgg-webhook
+      (Settings: https://top.gg/bot/YOUR_BOT_ID/webhooks)
     """
 
     def __init__(self, bot: commands.Bot, penalty_manager: PenaltyManager,
-                 topgg_token: str):
+                 topgg_token: Optional[str],
+                 webhook_port: Optional[int],
+                 webhook_auth: Optional[str]):
         self.bot              = bot
         self.pm               = penalty_manager
         self._token           = topgg_token
+        self._webhook_port    = webhook_port
+        self._webhook_auth    = webhook_auth
         self._seen_votes:     set[str] = set()
         self._announce_ch:    Optional[discord.TextChannel] = None
-        self.poll_votes.start()
+        self._webhook_runner: Optional[aiohttp.web.AppRunner] = None
+
+        if topgg_token:
+            self.poll_votes.start()
 
     def cog_unload(self):
-        self.poll_votes.cancel()
+        if self._token:
+            self.poll_votes.cancel()
+        if self._webhook_runner:
+            asyncio.create_task(self._stop_webhook())
 
     def set_announce_channel(self, channel: discord.TextChannel) -> None:
         self._announce_ch = channel
 
+    # ── Webhook server ────────────────────────────────────────────────
+
+    async def start_webhook_server(self) -> None:
+        """Start the aiohttp webhook listener. Called from on_ready."""
+        if not self._webhook_port:
+            return
+
+        app = aiohttp.web.Application()
+        app.router.add_post("/topgg-webhook", self._handle_webhook)
+        self._webhook_runner = aiohttp.web.AppRunner(app)
+        await self._webhook_runner.setup()
+        site = aiohttp.web.TCPSite(self._webhook_runner, "0.0.0.0", self._webhook_port)
+        await site.start()
+        logger.info("top.gg webhook server listening on port %s", self._webhook_port)
+
+    async def _stop_webhook(self) -> None:
+        if self._webhook_runner:
+            await self._webhook_runner.cleanup()
+
+    async def _handle_webhook(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        """
+        POST /topgg-webhook
+        top.gg sends: { "bot": "...", "user": "...", "type": "upvote"|"test", "isWeekend": bool }
+        Must respond 200 within 5 seconds or top.gg retries (up to 10 times, exponential backoff).
+        """
+        # Verify authorization header
+        if self._webhook_auth:
+            auth = request.headers.get("Authorization", "")
+            if auth != self._webhook_auth:
+                logger.warning("top.gg webhook: bad auth header")
+                return aiohttp.web.Response(status=401, text="Unauthorized")
+
+        try:
+            data = await request.json()
+        except Exception:
+            return aiohttp.web.Response(status=400, text="Bad JSON")
+
+        vote_type = data.get("type", "")
+        user_id   = str(data.get("user", ""))
+        is_test   = vote_type == "test"
+
+        logger.info("top.gg webhook received: user=%s type=%s", user_id, vote_type)
+
+        if user_id and (vote_type == "upvote" or is_test):
+            # Fire-and-forget — we must return 200 within 5s
+            asyncio.create_task(
+                self.pm.record_vote(user_id, channel=self._announce_ch, is_test=is_test)
+            )
+
+        # Acknowledge immediately — top.gg requires 200 within 5 seconds
+        return aiohttp.web.Response(status=200, text="OK")
+
+    # ── Poll fallback ─────────────────────────────────────────────────
+
     @tasks.loop(minutes=TOPGG_POLL_INTERVAL_MINS)
     async def poll_votes(self):
-        if not self.bot.user:
+        """Poll top.gg /votes endpoint for recent voters."""
+        if not self.bot.user or not self._token:
             return
         url     = f"https://top.gg/api/bots/{self.bot.user.id}/votes"
         headers = {"Authorization": self._token}
@@ -560,7 +648,7 @@ class TopGGCog(commands.Cog, name="TopGG"):
             self._seen_votes.add(user_id)
             await self.pm.record_vote(user_id, channel=self._announce_ch)
 
-        # Keep seen_votes from growing forever
+        # Prevent unbounded growth
         if len(self._seen_votes) > 500:
             self._seen_votes = set(list(self._seen_votes)[-500:])
 
