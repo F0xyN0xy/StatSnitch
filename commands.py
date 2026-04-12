@@ -602,10 +602,58 @@ class StatCog(commands.Cog, name="StatSnitch"):
         await ctx.send(embed=embed)
 
     # ==================================================================
+    # ██  VOTE
+    # ==================================================================
+
+    @commands.command(name="vote")
+    async def vote(self, ctx: commands.Context):
+        """🗳️ Vote for StatSnitch on top.gg (and get a freeze pardon if frozen)."""
+        from spam import _freeze_remaining_str
+
+        uid    = str(ctx.author.id)
+        u      = self.db.get_user(uid, ctx.author.display_name)
+        bot_id = getattr(self.db, '_bot_id', 0)
+        link   = f"https://top.gg/bot/{bot_id}/vote"
+
+        freeze_str = _freeze_remaining_str(u.get("stats_frozen_until"))
+        is_frozen  = self.db.is_frozen(uid)
+
+        embed = discord.Embed(
+            title="🗳️ Vote for StatSnitch on top.gg!",
+            description=f"**[👉 Click here to vote]({link})**",
+            color=discord.Color.red() if is_frozen else discord.Color.blurple(),
+            url=link,
+        )
+
+        if is_frozen:
+            embed.add_field(
+                name="❄️ You're currently frozen",
+                value=(
+                    f"{freeze_str}\n"
+                    f"Vote now and your freeze time is **cut in half automatically**. "
+                    f"No command needed — just vote and wait a few minutes."
+                ),
+                inline=False,
+            )
+        else:
+            embed.add_field(
+                name="Why vote?",
+                value=(
+                    "Voting helps StatSnitch appear higher on top.gg so more servers can find it. "
+                    "You can vote every **12 hours**.\n"
+                    "If you ever get a spam freeze, a vote will cut it in half. 💡"
+                ),
+                inline=False,
+            )
+
+        embed.set_footer(text="Votes are tracked automatically. No extra steps needed.")
+        await ctx.send(embed=embed)
+
+    # ==================================================================
     # ██  HELP
     # ==================================================================
 
-    @commands.command(name="help")
+    @commands.command(name="statshelp")
     async def statshelp(self, ctx: commands.Context):
         """📋 Show all StatSnitch commands."""
         embed = discord.Embed(
@@ -652,6 +700,9 @@ class StatCog(commands.Cog, name="StatSnitch"):
                 "`,toplinks` — Top link sharers",
                 "`,topattachments` — Top file senders",
                 "`,topedits` — Most edits",
+            ],
+            "🗳️ Support": [
+                "`,vote` — Vote for StatSnitch on top.gg",
             ],
         }
         for section, cmds in sections.items():

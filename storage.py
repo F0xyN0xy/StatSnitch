@@ -127,23 +127,40 @@ class Storage:
                 raise RuntimeError(f"Failed to fetch JSONBin bin: {resp.status} {text}")
 
     async def save(self) -> None:
-        """Flush all data to JSONBin."""
+        """Flush all data to JSONBin, with up to 3 retries on network errors."""
         async with self._flush_lock:
-            async with aiohttp.ClientSession() as session:
-                url = f"{self.JSONBIN_BASE}/b/{self._bin_id}"
-                headers = {
-                    "Content-Type": "application/json",
-                    "X-Master-Key": self._api_key,
-                }
-                payload = {"users": self._data}
-                async with session.put(url, headers=headers, json=payload) as resp:
-                    if resp.status == 200:
-                        self._dirty_count = 0
-                        self._last_flush  = time.monotonic()
-                        logger.debug("Flushed data to JSONBin.")
-                    else:
-                        text = await resp.text()
-                        logger.error("JSONBin flush failed: %s %s", resp.status, text)
+            url = f"{self.JSONBIN_BASE}/b/{self._bin_id}"
+            headers = {
+                "Content-Type": "application/json",
+                "X-Master-Key": self._api_key,
+            }
+            payload = {"users": self._data}
+
+            for attempt in range(1, 4):  # attempts 1, 2, 3
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.put(
+                            url, headers=headers, json=payload,
+                            timeout=aiohttp.ClientTimeout(total=15),
+                        ) as resp:
+                            if resp.status == 200:
+                                self._dirty_count = 0
+                                self._last_flush  = time.monotonic()
+                                logger.debug("Flushed data to JSONBin.")
+                                return
+                            else:
+                                text = await resp.text()
+                                logger.error("JSONBin flush failed (attempt %d/3): %s %s",
+                                             attempt, resp.status, text)
+                except aiohttp.ClientError as exc:
+                    logger.warning("JSONBin network error (attempt %d/3): %s", attempt, exc)
+
+                if attempt < 3:
+                    wait = 2 ** attempt  # 2s, 4s
+                    logger.info("Retrying JSONBin flush in %ds...", wait)
+                    await asyncio.sleep(wait)
+
+            logger.error("JSONBin flush gave up after 3 attempts — data held in memory.")
 
     async def maybe_flush(self) -> None:
         """Flush if dirty threshold or time interval is reached."""

@@ -26,6 +26,7 @@ from storage import Storage
 from commands import StatCog
 from personality import MILESTONES, milestone_message, streak_milestone_message
 from spam import SpamDetector, SpamAdminCog, TopGGCog, PenaltyManager
+from owner import OwnerCog
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -48,7 +49,8 @@ load_dotenv()
 TOKEN         = os.getenv("DISCORD_TOKEN")
 JSONBIN_KEY   = os.getenv("JSONBIN_API_KEY")
 JSONBIN_BIN   = os.getenv("JSONBIN_BIN_ID") or None
-BOT_PREFIX    = os.getenv("BOT_PREFIX", "!")
+BOT_PREFIX    = os.getenv("BOT_PREFIX", ".")
+OWNER_ID      = int(os.getenv("OWNER_ID", "0"))
 TOPGG_TOKEN              = os.getenv("TOPGG_TOKEN") or None
 TOPGG_ANNOUNCE_CHANNEL   = os.getenv("TOPGG_ANNOUNCE_CHANNEL_ID") or None
 TOPGG_WEBHOOK_PORT       = int(os.getenv("TOPGG_WEBHOOK_PORT", "0")) or None
@@ -70,13 +72,20 @@ intents.reactions        = True
 intents.voice_states     = True
 intents.guilds           = True
 
-bot            = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None)
+def _get_prefix(bot_instance, message: discord.Message):
+    """Accept both BOT_PREFIX (.) for regular commands and ',' for owner commands."""
+    return [BOT_PREFIX, ","]
+
+bot            = commands.Bot(command_prefix=_get_prefix, intents=intents, help_command=None)
 db             = Storage(api_key=JSONBIN_KEY, bin_id=JSONBIN_BIN)
 spam_detector  = SpamDetector()
 penalty_manager = PenaltyManager(db)
 
 # Track previous message counts per user for milestone detection
 _prev_counts: dict[str, int] = {}
+# Track total commands used per user for vote nudge
+_cmd_counts: dict[str, int] = {}
+VOTE_NUDGE_EVERY = 25   # nudge at 25, 50, 75, 100 … commands
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +105,12 @@ async def on_ready():
 
     await bot.add_cog(StatCog(bot, db))
     await bot.add_cog(SpamAdminCog(bot, db, spam_detector, penalty_manager))
+    await bot.add_cog(OwnerCog(bot, db, penalty_manager, OWNER_ID))
+
+    if OWNER_ID:
+        logger.info("Owner commands enabled for user ID %s (prefix: ,)", OWNER_ID)
+    else:
+        logger.warning("OWNER_ID not set — owner commands (,unfreeze etc.) are disabled.")
 
     # top.gg vote pardon integration
     if TOPGG_TOKEN or TOPGG_WEBHOOK_PORT:
@@ -117,7 +132,7 @@ async def on_ready():
         if TOPGG_TOKEN:
             logger.info("top.gg vote polling enabled (every %d min)", 5)
     else:
-        logger.info("No TOPGG_TOKEN or TOPGG_WEBHOOK_PORT — !votepardon manual mode only.")
+        logger.info("No TOPGG_TOKEN or TOPGG_WEBHOOK_PORT — vote pardons via automatic detection only.")
 
     periodic_flush.start()
     logger.info("StatSnitch is online and judging everyone. 👀")
@@ -129,8 +144,27 @@ async def on_ready():
 # ---------------------------------------------------------------------------
 @tasks.loop(minutes=5)
 async def periodic_flush():
-    await db.save()
-    logger.debug("Periodic flush completed.")
+    try:
+        await db.save()
+        logger.debug("Periodic flush completed.")
+    except Exception as exc:
+        # save() handles retries internally — this is a last-resort catch so
+        # the task loop itself never terminates from a transient network error
+        logger.error("Periodic flush unexpected error: %s", exc)
+
+
+@periodic_flush.error
+async def periodic_flush_error(exc: Exception):
+    """
+    Called by discord.py when periodic_flush raises an unhandled exception.
+    We log it and let the task keep running — don't re-raise.
+    The DNS errors in the logs are harmless transient blips; the task
+    auto-resumes and data is safe in memory until the next flush succeeds.
+    """
+    logger.warning(
+        "periodic_flush error (task will auto-retry): %s: %s",
+        type(exc).__name__, exc,
+    )
 
 
 @periodic_flush.before_loop
@@ -149,6 +183,14 @@ async def on_message(message: discord.Message):
     uid   = str(message.author.id)
     uname = message.author.display_name
     ts    = message.created_at.replace(tzinfo=timezone.utc)
+
+    # ------------------------------------------------------------------
+    # Developer / tester bypass — skip ALL tracking and spam detection
+    # but still process commands so they can test bot responses normally
+    # ------------------------------------------------------------------
+    if db.is_dev(uid, owner_id=OWNER_ID):
+        await bot.process_commands(message)
+        return
 
     # ------------------------------------------------------------------
     # Spam detection — runs BEFORE stat tracking
@@ -202,6 +244,40 @@ async def on_message(message: discord.Message):
 
     # Process commands
     await bot.process_commands(message)
+
+
+# ---------------------------------------------------------------------------
+# Vote nudge — fires every VOTE_NUDGE_EVERY commands per user
+# ---------------------------------------------------------------------------
+@bot.event
+async def on_command(ctx: commands.Context):
+    """Fires after every successfully parsed command invocation."""
+    if ctx.author.bot:
+        return
+    # Don't nudge dev/owner accounts — they're testing
+    if db.is_dev(str(ctx.author.id), owner_id=OWNER_ID):
+        return
+
+    uid    = str(ctx.author.id)
+    bot_id = getattr(db, '_bot_id', 0)
+
+    _cmd_counts[uid] = _cmd_counts.get(uid, 0) + 1
+    count = _cmd_counts[uid]
+
+    if count % VOTE_NUDGE_EVERY == 0:
+        link = f"https://top.gg/bot/{bot_id}/vote"
+        nudges = [
+            f"🗳️ Hey {ctx.author.mention}, you've used **{count} commands**! "
+            f"If you're enjoying StatSnitch, a vote helps a lot → {link}",
+            f"🗳️ {ctx.author.mention} — **{count} commands** and counting. "
+            f"We're not asking for money, just a vote → {link}",
+            f"🗳️ {count} commands deep, {ctx.author.mention}. "
+            f"You clearly live here. Vote rent → {link}",
+            f"🗳️ **{count} commands**, {ctx.author.mention}. "
+            f"The bot is watching. It would appreciate a vote → {link}",
+        ]
+        import random
+        await ctx.send(random.choice(nudges), delete_after=30)
 
 
 # ---------------------------------------------------------------------------

@@ -503,8 +503,8 @@ def _build_announcement(name: str, strikes: int, reason: str,
         extra += f" Discord timeout: **{timeout_str}**."
 
     vote_hint = (
-        f"\n💡 **Second chance:** Vote for the bot at <https://top.gg/bot/{bot_id}/vote> "
-        f"then use `!votepardon` to cut your freeze time in half!"
+        f"\n💡 **Second chance:** Vote for the bot → <https://top.gg/bot/{bot_id}/vote>\n"
+        f"Your pardon is applied **automatically** the moment your vote is counted."
         if strikes >= 2 else ""
     )
 
@@ -712,7 +712,7 @@ class SpamAdminCog(commands.Cog, name="SpamAdmin"):
             inline=False,
         )
         if strikes >= 2:
-            embed.set_footer(text="💡 Vote on top.gg then use !votepardon to halve your freeze!")
+            embed.set_footer(text=f"💡 Vote on top.gg to automatically halve your freeze!")
         await ctx.send(embed=embed)
 
     @commands.command(name="spamclear")
@@ -785,19 +785,6 @@ class SpamAdminCog(commands.Cog, name="SpamAdmin"):
             )
         embed.description = "\n".join(lines)
         await ctx.send(embed=embed)
-
-    @commands.command(name="votepardon")
-    async def votepardon(self, ctx: commands.Context):
-        """🗳️ Apply your top.gg vote to halve your freeze time."""
-        uid = str(ctx.author.id)
-        u   = self.db._data.get(uid)
-        if not u or not self.db.is_frozen(uid):
-            await ctx.send(
-                "You're not frozen. Nothing to pardon. "
-                "But thank you for voting, we guess. 🙄"
-            )
-            return
-        await self.pm.record_vote(uid, channel=ctx.channel)
 
     @commands.command(name="spamqueue")
     async def spamqueue(self, ctx: commands.Context):
